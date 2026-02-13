@@ -1,0 +1,353 @@
+
+!pip install -q platypus-opt
+
+# Imports
+import time
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from google.colab import files
+import matplotlib.pyplot as plt
+from platypus import NSGAII, Problem, Real, Integer, CompoundOperator, SBX, PM
+import warnings
+warnings.filterwarnings("ignore")
+
+
+print("Upload two files: DNS dataset and QoS dataset")
+uploaded = files.upload()
+file_list = list(uploaded.keys())
+# Manually set names if needed:
+dns_file = file_list[0]   # or 'final_merged_dataset.csv'
+qos_file = file_list[1]   # or 'qws2_cleaned.csv'
+
+dns_df = pd.read_csv(dns_file, low_memory=False)
+qos_df = pd.read_csv(qos_file)
+qos_df = qos_df.select_dtypes(include=['float64', 'int64', 'int32', 'float32'])
+
+# Ensure required QoS cols exist
+required_cols = ['Latency', 'Throughput', 'Reliability', 'Availability']
+for col in required_cols:
+    if col not in qos_df.columns:
+        qos_df[col] = np.nan
+# Fill NaNs in QoS with column mean or small default
+for col in required_cols:
+    if qos_df[col].isna().all():
+        qos_df[col] = 1.0
+    else:
+        qos_df[col].fillna(qos_df[col].mean(), inplace=True)
+
+# Normalize reliability/availability if given as percentages > 1
+for col in ['Reliability','Availability']:
+    if qos_df[col].max() > 1.5:  # assume percentages
+        qos_df[col] = qos_df[col] / 100.0
+
+
+from sklearn.utils import check_consistent_length
+
+def run_dnsformer_metrics(cache_size, epochs=2, batch_size=64):
+    """
+    Trains DNSFormer on first `cache_size` samples and returns classification metrics + inference time (avg ms).
+    Returns dict: accuracy, precision, recall, f1, tpr, fpr, fnr, response_time_ms
+    """
+    # Prepare dataset
+    df_cleaned = dns_df.copy()
+    label_col = 'Label' if 'Label' in df_cleaned.columns else df_cleaned.columns[-1]
+    df_cleaned = df_cleaned[df_cleaned[label_col].notnull()]
+    y = df_cleaned[label_col]
+    X = df_cleaned.drop(columns=[label_col])
+    X = X.apply(pd.to_numeric, errors='coerce').dropna(axis=1).dropna()
+    y = y.loc[X.index]
+
+    # Guard: need at least 10 samples
+    if len(X) < 10:
+        raise ValueError("DNS dataset too small after cleaning")
+
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    limit = min(int(cache_size), len(X_scaled))
+    X_scaled = X_scaled[:limit]
+    y_enc = y_enc[:limit]
+
+    # Train-test split
+    X_train_np, X_test_np, y_train_np, y_test_np = train_test_split(X_scaled, y_enc, test_size=0.2, random_state=42, stratify=y_enc if len(np.unique(y_enc))>1 else None)
+    # Convert to tensors
+    X_train = torch.tensor(X_train_np, dtype=torch.float32).unsqueeze(1)
+    X_test = torch.tensor(X_test_np, dtype=torch.float32).unsqueeze(1)
+    y_train = torch.tensor(y_train_np, dtype=torch.long)
+    y_test = torch.tensor(y_test_np, dtype=torch.long)
+
+    # Model (small DNSFormer)
+    class DNSFormer(nn.Module):
+        def __init__(self, input_dim, num_classes):
+            super().__init__()
+            self.embedding = nn.Linear(input_dim, 64)
+            self.transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(d_model=64, nhead=4, batch_first=True),
+                num_layers=2
+            )
+            self.fc = nn.Linear(64, num_classes)
+        def forward(self, x):
+            x = self.embedding(x)
+            x = self.transformer(x)
+            x = x.mean(dim=1)
+            return self.fc(x)
+
+    model = DNSFormer(input_dim=X_train.shape[2], num_classes=len(np.unique(y_enc)))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.CrossEntropyLoss()
+    loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True)
+
+    model.train()
+    for epoch in range(max(1, epochs)):
+        for xb, yb in loader:
+            xb = xb.to(device); yb = yb.to(device)
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            optimizer.step()
+
+    # Inference + measure response time (avg ms per sample)
+    model.eval()
+    with torch.no_grad():
+        X_test_device = X_test.to(device)
+        t0 = time.time()
+        logits = model(X_test_device)
+        t1 = time.time()
+        preds = logits.argmax(dim=1).cpu().numpy()
+        y_true = y_test.numpy()
+        # avg inference time in ms
+        response_time_ms = (t1 - t0) / max(1, len(X_test_np)) * 1000.0
+
+    # Classification metrics (macro for multiclass)
+    accuracy = accuracy_score(y_true, preds)
+    precision = precision_score(y_true, preds, average='macro', zero_division=0)
+    recall = recall_score(y_true, preds, average='macro', zero_division=0)
+    f1 = f1_score(y_true, preds, average='macro', zero_division=0)
+    tpr_macro = recall  # TPR == recall (macro)
+
+    # Compute per-class confusion-based FPR and FNR, then macro-average
+    cm = confusion_matrix(y_true, preds)
+    num_classes = cm.shape[0]
+    fpr_list = []
+    fnr_list = []
+    for c in range(num_classes):
+        TP = cm[c, c]
+        FN = cm[c, :].sum() - TP
+        FP = cm[:, c].sum() - TP
+        TN = cm.sum() - TP - FN - FP
+        fpr = FP / (FP + TN) if (FP + TN) > 0 else 0.0
+        fnr = FN / (TP + FN) if (TP + FN) > 0 else 0.0
+        fpr_list.append(fpr)
+        fnr_list.append(fnr)
+    fpr_macro = np.mean(fpr_list)
+    fnr_macro = np.mean(fnr_list)
+
+    return {
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "tpr": float(tpr_macro),
+        "fpr": float(fpr_macro),
+        "fnr": float(fnr_macro),
+        "response_time_ms": float(response_time_ms)
+    }
+
+
+def extract_qos_metrics(top_n):
+    top_n = max(int(top_n), 1)
+    top_n = min(top_n, len(qos_df))
+    subset = qos_df.sort_values(by='Throughput', ascending=False).head(top_n)
+    latency = float(subset['Latency'].mean())
+    throughput = float(subset['Throughput'].mean())
+    reliability = float(subset['Reliability'].mean())
+    availability = float(subset['Availability'].mean())
+    # Ensure normalized reliability/availability in [0,1]
+    if reliability > 1.5: reliability = reliability / 100.0
+    if availability > 1.5: availability = availability / 100.0
+    return {
+        "latency": latency,
+        "throughput": throughput,
+        "reliability": reliability,
+        "availability": availability
+    }
+
+
+def fitness(vars):
+    cache_size = vars[0]
+    top_n = int(vars[1])
+
+    # DNS classification metrics
+    cm = run_dnsformer_metrics(cache_size, epochs=2)
+    # QoS metrics
+    qm = extract_qos_metrics(top_n)
+
+    # Build objectives (all minimized)
+    objs = [
+        1.0 - cm["accuracy"],
+        1.0 - cm["precision"],
+        1.0 - cm["recall"],
+        1.0 - cm["f1"],
+        1.0 - cm["tpr"],
+        cm["fpr"],
+        cm["fnr"],
+        cm["response_time_ms"],
+        qm["latency"],
+        -qm["throughput"],
+        -qm["reliability"],
+        -qm["availability"]
+    ]
+    return objs
+
+
+problem = Problem(2, 12)  # 2 decision variables, 12 objectives
+from platypus import Real, Integer
+problem.types[:] = [Real(100, 1000), Integer(10, 100)]
+problem.function = fitness
+
+# variator for mixed types
+variator = CompoundOperator(
+    SBX(probability=1.0, distribution_index=20),
+    PM(probability=1.0, distribution_index=20)
+)
+
+# Run NSGA-II
+algorithm = NSGAII(problem, variator=variator)
+algorithm.run(60)  # reduce to 60 for speed; increase later if you can
+
+rows = []
+for s in algorithm.result:
+    # extract decision variables (safe extraction)
+    cache_size = float(s.variables[0])
+    try:
+        top_n = int(s.variables[1])
+    except:
+        # sometimes platypus returns array-like
+        top_n = int(np.array(s.variables[1]).flatten()[0])
+
+    # objectives: remember they were minimized forms
+    acc = 1.0 - s.objectives[0]
+    prec = 1.0 - s.objectives[1]
+    rec = 1.0 - s.objectives[2]
+    f1 = 1.0 - s.objectives[3]
+    tpr = 1.0 - s.objectives[4]
+    fpr = s.objectives[5]
+    fnr = s.objectives[6]
+    response_time_ms = s.objectives[7]
+    latency = s.objectives[8]
+    throughput = -s.objectives[9]
+    reliability = -s.objectives[10]
+    availability = -s.objectives[11]
+
+    rows.append({
+        "Cache Size": cache_size,
+        "Top N": top_n,
+        "Accuracy": acc,
+        "Precision": prec,
+        "Recall": rec,
+        "F1": f1,
+        "TPR": tpr,
+        "FPR": fpr,
+        "FNR": fnr,
+        "ResponseTime_ms": response_time_ms,
+        "Latency": latency,
+        "Throughput": throughput,
+        "Reliability": reliability,
+        "Availability": availability
+    })
+
+df_pareto = pd.DataFrame(rows)
+df_pareto_sorted = df_pareto.sort_values(by=["Accuracy","F1"], ascending=[False, False]).reset_index(drop=True)
+
+# Save CSV
+df_pareto_sorted.to_csv("pareto_full_12obj.csv", index=False)
+files.download("pareto_full_12obj.csv")
+
+
+
+# 1) Accuracy vs Latency scatter
+plt.figure(figsize=(6,4))
+plt.scatter(df_pareto["Latency"], df_pareto["Accuracy"], c='blue', alpha=0.7)
+plt.xlabel("Latency (ms)"); plt.ylabel("Accuracy")
+plt.title("Pareto: Accuracy vs Latency"); plt.grid(True); plt.show()
+
+# 2) F1 vs Latency
+plt.figure(figsize=(6,4))
+plt.scatter(df_pareto["Latency"], df_pareto["F1"], c='purple', alpha=0.7)
+plt.xlabel("Latency (ms)"); plt.ylabel("F1 (macro)")
+plt.title("Pareto: F1 vs Latency"); plt.grid(True); plt.show()
+
+# 3) Throughput vs Accuracy
+plt.figure(figsize=(6,4))
+plt.scatter(df_pareto["Throughput"], df_pareto["Accuracy"], c='green', alpha=0.7)
+plt.xlabel("Throughput"); plt.ylabel("Accuracy")
+plt.title("Pareto: Accuracy vs Throughput"); plt.grid(True); plt.show()
+
+# 4) Combined radar (top 5 solutions) - normalized and inverting latency/response_time so larger = better
+from math import pi
+def plot_combined_radar(df, top_k=5):
+    labels = ['Accuracy','Precision','Recall','F1','TPR','Reliability','Availability','Throughput','Latency_inv','ResponseTime_inv']
+    sub = df.copy().head(top_k).reset_index(drop=True)
+
+    # Prepare values and normalize each axis 0-1
+    vals = pd.DataFrame()
+    # Latency_inv and ResponseTime_inv are inverted so higher is better
+    vals['Accuracy'] = sub['Accuracy']
+    vals['Precision'] = sub['Precision']
+    vals['Recall'] = sub['Recall']
+    vals['F1'] = sub['F1']
+    vals['TPR'] = sub['TPR']
+    vals['Reliability'] = sub['Reliability']
+    vals['Availability'] = sub['Availability']
+    vals['Throughput'] = sub['Throughput']
+    vals['Latency_inv'] = sub['Latency'].max() - sub['Latency']  # bigger = better
+    vals['ResponseTime_inv'] = sub['ResponseTime_ms'].max() - sub['ResponseTime_ms']
+
+    # Normalize each column 0-1
+    for c in vals.columns:
+        rng = vals[c].max() - vals[c].min()
+        if rng == 0:
+            vals[c] = 0.5
+        else:
+            vals[c] = (vals[c] - vals[c].min()) / rng
+
+    angles = [n / float(len(labels)) * 2 * pi for n in range(len(labels))]
+    angles += angles[:1]
+
+    fig, ax = plt.subplots(figsize=(8,8), subplot_kw=dict(polar=True))
+    for i in range(len(vals)):
+        data = vals.loc[i].tolist()
+        data += data[:1]
+        ax.plot(angles, data, linewidth=1, label=f'Sol #{i+1}')
+        ax.fill(angles, data, alpha=0.1)
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_yticks([])
+    plt.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
+    plt.title(f"Combined radar (top {len(vals)})")
+    plt.show()
+
+plot_combined_radar(df_pareto_sorted, top_k=5)
+
+# 5) Summary table: Best Accuracy, Best Latency, Balanced (middle)
+best_acc = df_pareto_sorted.sort_values('Accuracy', ascending=False).iloc[0]
+best_latency = df_pareto_sorted.sort_values('Latency').iloc[0]
+balanced = df_pareto_sorted.iloc[len(df_pareto_sorted)//2]
+summary = pd.DataFrame([best_acc, best_latency, balanced], index=['Best Accuracy','Best Latency','Balanced']).round(4)
+print(summary.T)
+
+# End
+print("Done. CSV downloaded and visualizations shown.")
